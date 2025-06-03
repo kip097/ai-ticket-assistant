@@ -1,105 +1,96 @@
-import os
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from datasets import Dataset, load_metric
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+from sklearn.preprocessing import LabelEncoder
 import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+from datasets import Dataset
 from peft import get_peft_model, LoraConfig, TaskType
 
-# Пути
-DATA_PATH = '../data/sample_tickets.csv'   # путь к датасету (относительно папки src)
-MODEL_SAVE_PATH = '../models/ticket_classifier_model'
+def prepare_data(path):
+    df = pd.read_csv(path)
+    df = df.dropna(subset=['text', 'category'])
+    label_encoder = LabelEncoder()
+    df['label'] = label_encoder.fit_transform(df['category'])
+    return df, label_encoder
 
-# 1. Загружаем данные
-df = pd.read_csv(DATA_PATH)
-print(f"Всего заявок: {len(df)}")
+def tokenize_function(examples, tokenizer):
+    return tokenizer(examples['text'], padding='max_length', truncation=True, max_length=128)
 
-# 2. Преобразуем категории в числовые метки
-labels = df['category'].unique().tolist()
-label2id = {label: i for i, label in enumerate(labels)}
-id2label = {i: label for label, i in label2id.items()}
-df['label'] = df['category'].map(label2id)
+def main():
+    # 1. Загружаем данные
+    df, label_encoder = prepare_data("data/sample_tickets.csv")
 
-# 3. Делим на train/test
-train_df, test_df = train_test_split(df, test_size=0.2, stratify=df['label'], random_state=42)
+    # 2. Разбиваем на train/test
+    train_df, test_df = train_test_split(df, test_size=0.2, random_state=42, stratify=df['label'])
 
-# 4. Загружаем токенизатор и модель (берём pretrained LLaMA, замените на нужную)
-MODEL_NAME = 'bert-base-uncased'  # Замените на нужную модель, например 'meta-llama/Llama-2-7b-hf' (если доступна)
+    # 3. Преобразуем в Dataset для Hugging Face
+    train_ds = Dataset.from_pandas(train_df)
+    test_ds = Dataset.from_pandas(test_df)
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    # 4. Загружаем токенизатор и модель (берём LLaMA, например, 7b или меньшую для теста)
+    model_name = "decapoda-research/llama-7b-hf"  # замените на доступную модель
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=len(label_encoder.classes_))
 
-# 5. Подготовка датасетов для transformers
-def preprocess(batch):
-    return tokenizer(batch['text'], truncation=True, padding='max_length', max_length=128)
+    # 5. Токенизируем
+    train_ds = train_ds.map(lambda x: tokenize_function(x, tokenizer), batched=True)
+    test_ds = test_ds.map(lambda x: tokenize_function(x, tokenizer), batched=True)
 
-train_dataset = Dataset.from_pandas(train_df)
-test_dataset = Dataset.from_pandas(test_df)
+    # 6. Указываем колонки для обучения
+    train_ds = train_ds.remove_columns(["text", "category", "__index_level_0__"])
+    test_ds = test_ds.remove_columns(["text", "category", "__index_level_0__"])
 
-train_dataset = train_dataset.map(preprocess, batched=True)
-test_dataset = test_dataset.map(preprocess, batched=True)
+    train_ds.set_format("torch")
+    test_ds.set_format("torch")
 
-train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
-test_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
+    # 7. Добавляем LoRA для дообучения
+    peft_config = LoraConfig(
+        task_type=TaskType.SEQ_CLS,
+        inference_mode=False,
+        r=8,
+        lora_alpha=32,
+        lora_dropout=0.1,
+    )
+    model = get_peft_model(model, peft_config)
 
-# 6. Загружаем модель для классификации
-model = AutoModelForSequenceClassification.from_pretrained(
-    MODEL_NAME,
-    num_labels=len(labels),
-    id2label=id2label,
-    label2id=label2id,
-)
+    # 8. Настраиваем Trainer
+    training_args = TrainingArguments(
+        output_dir="models/",
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        evaluation_strategy="epoch",
+        num_train_epochs=3,
+        save_strategy="epoch",
+        logging_dir="./logs",
+        logging_steps=10,
+        load_best_model_at_end=True,
+        metric_for_best_model="accuracy",
+        greater_is_better=True,
+    )
 
-# 7. Настройка LoRA (пример)
-lora_config = LoraConfig(
-    task_type=TaskType.SEQ_CLS,
-    r=8,
-    lora_alpha=32,
-    lora_dropout=0.1,
-    target_modules=["query", "value"]  # для BERT, подберите для вашей модели
-)
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        preds = logits.argmax(axis=-1)
+        accuracy = (preds == labels).mean()
+        return {"accuracy": accuracy}
 
-model = get_peft_model(model, lora_config)
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=test_ds,
+        compute_metrics=compute_metrics,
+    )
 
-# 8. Метрика для оценки
-metric = load_metric('f1')
+    # 9. Запускаем обучение
+    trainer.train()
 
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    predictions = logits.argmax(axis=-1)
-    return metric.compute(predictions=predictions, references=labels, average='weighted')
+    # 10. Сохраняем модель и label encoder
+    model.save_pretrained("models/classifier_lora")
+    tokenizer.save_pretrained("models/classifier_lora")
 
-# 9. Параметры обучения
-training_args = TrainingArguments(
-    output_dir='./results',
-    evaluation_strategy='epoch',
-    save_strategy='epoch',
-    learning_rate=5e-5,
-    per_device_train_batch_size=16,
-    per_device_eval_batch_size=16,
-    num_train_epochs=3,
-    weight_decay=0.01,
-    save_total_limit=2,
-    load_best_model_at_end=True,
-    metric_for_best_model='f1',
-    greater_is_better=True,
-)
+    import joblib
+    joblib.dump(label_encoder, "models/label_encoder.pkl")
 
-# 10. Создаём Trainer
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=test_dataset,
-    compute_metrics=compute_metrics,
-)
-
-# 11. Запускаем обучение
-trainer.train()
-
-# 12. Сохраняем модель
-os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
-model.save_pretrained(MODEL_SAVE_PATH)
-tokenizer.save_pretrained(MODEL_SAVE_PATH)
-
-print(f"Модель и токенизатор сохранены в {MODEL_SAVE_PATH}")
-
+if __name__ == "__main__":
+    main()
