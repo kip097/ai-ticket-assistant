@@ -1,66 +1,105 @@
+import os
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from datasets import Dataset, load_metric
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
 import torch
+from peft import get_peft_model, LoraConfig, TaskType
 
-# 1. Загрузка датасета
-df = pd.read_csv('sample_tickets.csv')
+# Пути
+DATA_PATH = '../data/sample_tickets.csv'   # путь к датасету (относительно папки src)
+MODEL_SAVE_PATH = '../models/ticket_classifier_model'
 
-# 2. Преобразуем категории в числа
-label2id = {"срочные": 0, "жалобы": 1, "вопросы": 2}
+# 1. Загружаем данные
+df = pd.read_csv(DATA_PATH)
+print(f"Всего заявок: {len(df)}")
+
+# 2. Преобразуем категории в числовые метки
+labels = df['category'].unique().tolist()
+label2id = {label: i for i, label in enumerate(labels)}
+id2label = {i: label for label, i in label2id.items()}
 df['label'] = df['category'].map(label2id)
 
-# 3. Делим на train и test
-train_texts, val_texts, train_labels, val_labels = train_test_split(
-    df['text'].tolist(), df['label'].tolist(), test_size=0.2, random_state=42
+# 3. Делим на train/test
+train_df, test_df = train_test_split(df, test_size=0.2, stratify=df['label'], random_state=42)
+
+# 4. Загружаем токенизатор и модель (берём pretrained LLaMA, замените на нужную)
+MODEL_NAME = 'bert-base-uncased'  # Замените на нужную модель, например 'meta-llama/Llama-2-7b-hf' (если доступна)
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+# 5. Подготовка датасетов для transformers
+def preprocess(batch):
+    return tokenizer(batch['text'], truncation=True, padding='max_length', max_length=128)
+
+train_dataset = Dataset.from_pandas(train_df)
+test_dataset = Dataset.from_pandas(test_df)
+
+train_dataset = train_dataset.map(preprocess, batched=True)
+test_dataset = test_dataset.map(preprocess, batched=True)
+
+train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
+test_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
+
+# 6. Загружаем модель для классификации
+model = AutoModelForSequenceClassification.from_pretrained(
+    MODEL_NAME,
+    num_labels=len(labels),
+    id2label=id2label,
+    label2id=label2id,
 )
 
-# 4. Загружаем токенизатор и модель
-model_name = "bert-base-multilingual-cased"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=3)
+# 7. Настройка LoRA (пример)
+lora_config = LoraConfig(
+    task_type=TaskType.SEQ_CLS,
+    r=8,
+    lora_alpha=32,
+    lora_dropout=0.1,
+    target_modules=["query", "value"]  # для BERT, подберите для вашей модели
+)
 
-# 5. Токенизация
-train_encodings = tokenizer(train_texts, truncation=True, padding=True)
-val_encodings = tokenizer(val_texts, truncation=True, padding=True)
+model = get_peft_model(model, lora_config)
 
-# 6. Создаем Dataset для Trainer
-class TicketDataset(torch.utils.data.Dataset):
-    def __init__(self, encodings, labels):
-        self.encodings = encodings
-        self.labels = labels
-    def __getitem__(self, idx):
-        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
-        item['labels'] = torch.tensor(self.labels[idx])
-        return item
-    def __len__(self):
-        return len(self.labels)
+# 8. Метрика для оценки
+metric = load_metric('f1')
 
-train_dataset = TicketDataset(train_encodings, train_labels)
-val_dataset = TicketDataset(val_encodings, val_labels)
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    predictions = logits.argmax(axis=-1)
+    return metric.compute(predictions=predictions, references=labels, average='weighted')
 
-# 7. Настройка тренировки
+# 9. Параметры обучения
 training_args = TrainingArguments(
     output_dir='./results',
-    num_train_epochs=3,
+    evaluation_strategy='epoch',
+    save_strategy='epoch',
+    learning_rate=5e-5,
     per_device_train_batch_size=16,
-    per_device_eval_batch_size=64,
-    evaluation_strategy="epoch",
-    save_strategy="epoch",
-    logging_dir='./logs',
-    logging_steps=10,
+    per_device_eval_batch_size=16,
+    num_train_epochs=3,
+    weight_decay=0.01,
+    save_total_limit=2,
+    load_best_model_at_end=True,
+    metric_for_best_model='f1',
+    greater_is_better=True,
 )
 
+# 10. Создаём Trainer
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
-    eval_dataset=val_dataset,
+    eval_dataset=test_dataset,
+    compute_metrics=compute_metrics,
 )
 
-# 8. Обучение
+# 11. Запускаем обучение
 trainer.train()
 
-# 9. Сохранение модели
-model.save_pretrained('./ticket_classifier_model')
-tokenizer.save_pretrained('./ticket_classifier_model')
+# 12. Сохраняем модель
+os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
+model.save_pretrained(MODEL_SAVE_PATH)
+tokenizer.save_pretrained(MODEL_SAVE_PATH)
+
+print(f"Модель и токенизатор сохранены в {MODEL_SAVE_PATH}")
+
