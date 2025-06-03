@@ -4,3 +4,7 @@ torch
 transformers
 datasets
 peft
+faiss-cpu
+fastapi
+uvicorn
+python-multipart
